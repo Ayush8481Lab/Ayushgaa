@@ -2,7 +2,7 @@ export default {
   async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     const reqUrl = new URL(request.url);
 
-    // 1. Handle CORS instantly
+    // 1. Instant CORS
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -13,21 +13,23 @@ export default {
       });
     }
 
-    // 2. Map route (e.g., worker.dev/search -> apiv2.gaana.com/search)
     const targetUrl = `https://apiv2.gaana.com${reqUrl.pathname}${reqUrl.search}`;
 
-    // 3. Edge Caching Setup
+    // 2. Setup Cache
     const cache = caches.default;
     const cacheKey = new Request(targetUrl, request);
 
-    // 4. Return cached response instantly (~10ms) if available
+    // 3. Cache HIT: Return instantly
     let response = await cache.match(cacheKey);
     if (response) {
-      return response;
+      // We clone it to add a header so you can debug if cache is working!
+      const cachedResponse = new Response(response.body, response);
+      cachedResponse.headers.set('X-Proxy-Cache', 'HIT');
+      return cachedResponse;
     }
 
-    // 5. Fetch from Gaana if not in cache
     try {
+      // 4. Cache MISS: Fetch from Gaana
       const gaanaResponse = await fetch(targetUrl, {
         method: 'GET',
         headers: {
@@ -35,43 +37,42 @@ export default {
           'deviceType': 'GaanaAndroidApp',
           'appVersion': 'V5',
           'Accept': 'application/json, text/plain, */*',
+          'Accept-Encoding': 'gzip, deflate, br', // 🔥 CRITICAL: Forces Gaana to send compressed, fast data
           'Origin': 'https://gaana.com',
           'Referer': 'https://gaana.com/'
         }
       });
 
       if (!gaanaResponse.ok) {
-        return Response.json({
-          success: false,
-          error: `Gaana blocked request: ${gaanaResponse.status}`,
-          url_attempted: targetUrl
-        }, { status: gaanaResponse.status, headers: { 'Access-Control-Allow-Origin': '*' } });
+        return new Response(await gaanaResponse.text(), { 
+          status: gaanaResponse.status, 
+          headers: { 'Access-Control-Allow-Origin': '*' } 
+        });
       }
 
-      // 6. Wrap data
-      const gaanaData = await gaanaResponse.json();
-      const finalResponse = Response.json({
-        success: true,
-        source_url: targetUrl,
-        data: gaanaData
-      }, {
+      // 5. 🔥 THE SPEED UP: STREAMING 🔥
+      // Instead of waiting for .json(), we pass gaanaResponse.body directly!
+      // This routes the network stream directly to the user instantly.
+      const finalResponse = new Response(gaanaResponse.body, {
+        status: gaanaResponse.status,
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 's-maxage=3600' // Cache at Cloudflare Edge for 1 Hour
+          'Content-Type': gaanaResponse.headers.get('Content-Type') || 'application/json',
+          'Cache-Control': 'public, s-maxage=3600', // Cache at edge for 1 hour
+          'X-Proxy-Cache': 'MISS'
         }
       });
 
-      // 7. Save to cache in the background (Non-blocking)
+      // 6. Non-blocking cache put
       ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
 
       return finalResponse;
 
     } catch (error: any) {
-      return Response.json({
-        success: false,
-        error: 'Internal Server Error',
-        message: error.message || String(error)
-      }, { status: 500, headers: { 'Access-Control-Allow-Origin': '*' } });
+      return new Response(JSON.stringify({ error: error.message }), { 
+        status: 500, 
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } 
+      });
     }
   },
 };
